@@ -48,9 +48,17 @@ now chunk header(size + prev_inuse_bit)     next header
 
 // header shape
 /*
-last_chunk_is_Freed                         size(0x11)
-free_chunk_fd                               free_chunk_bk
-size(0x11)
+last_chunk_is_Freed                         size(0x51)
+free_chunk_fd[0x10, 0x20)                   free_chunk_bk[0x10, 0x20)
+free_chunk_fd[0x20, 0x40)                   free_chunk_bk[0x20, 0x40)
+free_chunk_fd[0x40, 0x80)                   free_chunk_bk[0x40, 0x80)
+free_chunk_fd[0x80, 0x100)                  free_chunk_bk[0x80, 0x100)
+free_chunk_fd[0x100, 0x200)                 free_chunk_bk[0x100, 0x200)
+free_chunk_fd[0x200, 0x400)                 free_chunk_bk[0x200, 0x400)
+free_chunk_fd[0x400, 0x800)                 free_chunk_bk[0x400, 0x800)
+free_chunk_fd[0x800, 0x1000)                free_chunk_bk[0x800, 0x1000)
+free_chunk_fd(over 0x1000)                  free_chunk_bk(over 0x1000)
+size(0x51)
 
 */
 
@@ -75,10 +83,10 @@ int i = 0;
 #define NEXT_PTR(ptr)           ((size_t *)(V2C(ptr)+SIZE(ptr)))
 
 #define MAIN_ARENA              (V2C(mem_heap_lo())+DWORD*2)
-#define MAIN_ARENA_FD           (MAIN_ARENA)
-#define MAIN_ARENA_BK           (V2C(MAIN_ARENA)+DWORD)
-#define SET_HEADER_FD(fd)       PUT(MAIN_ARENA_FD, P2D(fd))
-#define SET_HEADER_BK(bk)       PUT(MAIN_ARENA_BK, P2D(bk))
+#define MAIN_ARENA_FD(p)        (MAIN_ARENA+QWORD*p)
+#define MAIN_ARENA_BK(p)        (V2C(MAIN_ARENA)+QWORD*p+DWORD)
+#define SET_HEADER_FD(fd, p)    PUT(MAIN_ARENA_FD(p), P2D(fd))
+#define SET_HEADER_BK(bk, p)    PUT(MAIN_ARENA_BK(p), P2D(bk))
 #define SET_CHUNK_FD(ptr, fd)   PUT(ptr, fd)
 #define SET_CHUNK_BK(ptr, bk)   PUT(V2C(ptr)+DWORD, bk)
 
@@ -93,6 +101,7 @@ int i = 0;
 
 #define IS_LAST_CHUNK_FREED     (GET(mem_heap_lo()))
 
+size_t PLACE(size_t size);
 void* FIND_IN_FREE_CHUNK(size_t size);
 void* SPLIT_AND_ALLOC_IN_FREE_CHUNK(void* ptr, size_t size);
 
@@ -105,13 +114,16 @@ void REMOVE_FROM_FREE_CHUNK_LIST(void* ptr);
  */
 int mm_init(void)
 {
-    mem_sbrk(QWORD*2+DWORD);
+    mem_sbrk(QWORD*10+DWORD);
 
     PUT(mem_heap_lo(), 0x0);
-    PUT(mem_heap_lo()+DWORD, 0x11);
-    PUT(mem_heap_lo()+QWORD, MAIN_ARENA_FD);
-    PUT(mem_heap_lo()+DWORD+QWORD, MAIN_ARENA_FD);
-    PUT(mem_heap_lo()+QWORD+QWORD, 0x11);
+    PUT(mem_heap_lo()+DWORD, 0x51);
+    for(int i=0; i<9; i++)
+    {
+        SET_HEADER_FD(MAIN_ARENA_FD(i), i);
+        SET_HEADER_BK(MAIN_ARENA_FD(i), i);
+    }
+    PUT(mem_heap_lo()+QWORD*10, 0x51);
 
     return 0;
 }
@@ -162,37 +174,31 @@ void mm_free(void *ptr)
 
     if(!IS_INUSE(PREV_PTR(ptr)) && P2D(NEXT_PTR(ptr)) < P2D(mem_heap_hi())  && !IS_INUSE(NEXT_PTR(ptr)))
     {
-        REMOVE_FROM_FREE_CHUNK_LIST(NEXT_PTR(ptr));
         new_size = SIZE(ptr) + PREV_SIZE(ptr) + NEXT_SIZE(ptr);
+        REMOVE_FROM_FREE_CHUNK_LIST(PREV_PTR(ptr));
+        REMOVE_FROM_FREE_CHUNK_LIST(NEXT_PTR(ptr));
+
         ptr = PREV_PTR(ptr);
-
-        SET_HEADER(ptr, new_size);
-        SET_FOOTER(ptr, new_size);
-        UNSET_INUSE(ptr);
-        UNSET_INUSE2(ptr);
-
-        return;
     }
     else if(!IS_INUSE(PREV_PTR(ptr)))
     {
         new_size = SIZE(ptr) + PREV_SIZE(ptr);
+        REMOVE_FROM_FREE_CHUNK_LIST(PREV_PTR(ptr));
         ptr = PREV_PTR(ptr);
-        SET_HEADER(ptr, new_size);
-        SET_FOOTER(ptr, new_size);
-        UNSET_INUSE(ptr);
-        UNSET_INUSE2(ptr);
-
-        return;
     }
     else if(P2D(NEXT_PTR(ptr)) < P2D(mem_heap_hi()) && !IS_INUSE(NEXT_PTR(ptr)))
     {
         REMOVE_FROM_FREE_CHUNK_LIST(NEXT_PTR(ptr));
 
         new_size = SIZE(ptr) + NEXT_SIZE(ptr);
-        SET_HEADER(ptr, new_size);
-        SET_FOOTER(ptr, new_size);
+    }
+    else
+    {
+        new_size = SIZE(ptr);
     }
     
+    SET_HEADER(ptr, new_size);
+    SET_FOOTER(ptr, new_size);
     UNSET_INUSE(ptr);
     UNSET_INUSE2(ptr);
 
@@ -205,14 +211,24 @@ void mm_free(void *ptr)
 void *mm_realloc(void *ptr, size_t size)
 {
     void *oldptr = ptr;
-    size_t len = SIZE(oldptr)-QWORD;
+    size_t new_size = ALIGN(size)+QWORD;
+    size_t old_size = SIZE(oldptr);
 
-    if(SIZE(ptr) >= ALIGN(size)+QWORD)
-        return ptr;
+    if(P2D(NEXT_PTR(ptr)) >= P2D(mem_heap_hi()))
+    {
+        if(new_size > old_size)
+        {
+            mem_sbrk(new_size-old_size);
+            SET_HEADER(ptr, new_size);
+            SET_FOOTER(ptr, new_size);
+            SET_INUSE(ptr);
+            SET_INUSE2(ptr);
+        }
+    }
     else
     {
         ptr = mm_malloc(size);
-        memcpy(V2C(ptr), V2C(oldptr), len);
+        memcpy(ptr, oldptr, old_size-QWORD);
         mm_free(oldptr);
     }
     return ptr;
@@ -220,19 +236,24 @@ void *mm_realloc(void *ptr, size_t size)
 
 void* FIND_IN_FREE_CHUNK(size_t size)
 {
-    void* ptr = S2V(BK(MAIN_ARENA));
-
-    while(ptr != MAIN_ARENA)
+    size_t place = PLACE(size);
+    while(place <= 8)
     {
-        if(SIZE(ptr) > size)
-            return SPLIT_AND_ALLOC_IN_FREE_CHUNK(ptr, size);
-        else if(SIZE(ptr) == size)
+        void* ptr = S2V(BK(MAIN_ARENA_FD(place)));
+
+        while(ptr != MAIN_ARENA_FD(place))
         {
-            REMOVE_FROM_FREE_CHUNK_LIST(ptr);
-            return ptr;
+            if(SIZE(ptr) > size)
+                return SPLIT_AND_ALLOC_IN_FREE_CHUNK(ptr, size);
+            else if(SIZE(ptr) == size)
+            {
+                REMOVE_FROM_FREE_CHUNK_LIST(ptr);
+                return ptr;
+            }
+            else
+                ptr = S2V(BK(ptr));
         }
-        else
-            ptr = S2V(BK(ptr));
+        place++;
     }
 
     return NULL;
@@ -260,10 +281,11 @@ void* SPLIT_AND_ALLOC_IN_FREE_CHUNK(void* ptr, size_t size)
 
 void APPEND_TO_FREE_CHUNK_LIST(void* ptr)
 {
-    SET_CHUNK_BK(ptr, BK(MAIN_ARENA));
-    SET_CHUNK_FD(ptr, MAIN_ARENA);
-    SET_CHUNK_FD(BK(MAIN_ARENA), ptr);
-    SET_HEADER_BK(ptr);
+    size_t place = PLACE(SIZE(ptr));
+    SET_CHUNK_BK(ptr, BK(MAIN_ARENA_FD(place)));
+    SET_CHUNK_FD(ptr, MAIN_ARENA_FD(place));
+    SET_CHUNK_FD(BK(MAIN_ARENA_FD(place)), ptr);
+    SET_HEADER_BK(ptr, place);
 }
 
 void REMOVE_FROM_FREE_CHUNK_LIST(void* ptr)
@@ -272,7 +294,18 @@ void REMOVE_FROM_FREE_CHUNK_LIST(void* ptr)
     SET_CHUNK_FD(BK(ptr), FD(ptr));
 }
 
+size_t PLACE(size_t size)
+{
+    int i = 0;
+    size >>= 5;
+    while(size && i < 8)
+    {
+        size >>= 1;
+        i++;
+    }
 
+    return i;
+}
 
 
 
